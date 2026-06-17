@@ -373,7 +373,12 @@ class MiniMaxM3Attention(nn.Module):
             # rather than becoming eligible for top-k block selection.
             if attention_mask is not None:
                 sparse_bias = sparse_bias + _padding_mask_to_additive_bias(attention_mask, sparse_bias)
-            attention_mask = sparse_bias
+            # The DSA bias is built in fp32; cast it to the main query's dtype so it matches q at
+            # the SDPA call. Anchor to ``q`` (not the indexer's dtype) so this stays correct even if
+            # the lightning indexer is run in fp32. Otherwise SDPA backends that enforce
+            # ``bias.dtype == query.dtype`` (memory-efficient, selected when cuDNN is disabled) raise
+            # "invalid dtype for bias - should match query's dtype".
+            attention_mask = sparse_bias.to(q.dtype)
 
         q, k = apply_rotary_emb_qk(
             q,
