@@ -261,8 +261,12 @@ def _install_torch_and_layers_stubs(monkeypatch):
     class MoE:
         pass
 
+    class Gate:
+        pass
+
     layers_stub.GroupedExpertsDeepEP = GroupedExpertsDeepEP
     layers_stub.MoE = MoE
+    layers_stub.Gate = Gate
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.layers", layers_stub)
 
     # Stub experts module to avoid importing torch.nn.functional
@@ -913,6 +917,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     class Inner:
         def __init__(self):
             self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer([])
 
     class Outer:
         def __init__(self):
@@ -961,7 +966,12 @@ def test_parallelize_model_accepts_top_level_moe_config(monkeypatch):
 
     world_mesh = FakeWorldMesh({"dp": 1, ("dp",): 1}, mesh_dim_names=["dp"])
     moe_mesh = FakeMoeMesh({"ep": 2})
-    model = type("Outer", (), {"moe_config": type("MC", (), {"n_routed_experts": 4})()})()
+    model = type(
+        "Outer",
+        (),
+        {"moe_config": type("MC", (), {"n_routed_experts": 4})(), "model": None},
+    )()
+    model.layers = LayerContainer([])
 
     P.parallelize_model(
         model=model,
@@ -977,6 +987,86 @@ def test_parallelize_model_accepts_top_level_moe_config(monkeypatch):
 
     apply_ep_mock.assert_called_once()
     apply_fsdp_mock.assert_not_called()
+
+
+def _make_gate_bias_model(P):
+    """Build a stub model with two MoE blocks (gates record set_bias_update_mesh calls) and one dense block."""
+    gates = []
+    blocks = []
+    for _ in range(2):
+        gate = P.Gate()
+        gate.mesh_calls = []
+        gate.set_bias_update_mesh = gate.mesh_calls.append
+        moe = P.MoE()
+        moe.gate = gate
+        gates.append(gate)
+        blocks.append(DummyBlock(mlp=moe))
+    blocks.append(DummyBlock(mlp=object()))  # dense layer: must be skipped
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer(blocks)
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    return Outer(), gates
+
+
+def test_parallelize_model_injects_fsdp_mesh_into_gates(monkeypatch):
+    """Gates get the full DP/CP mesh even with EP enabled (EP ranks hold independent token shards)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 4, "tp": 1}, mesh_dim_names=["dp", "tp"])
+    moe_mesh = FakeMoeMesh({"ep": 2, ("es1",): 2})
+    model, gates = _make_gate_bias_model(P)
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        dp_axis_names=("dp",),
+        cp_axis_name=None,
+        tp_axis_name=None,
+        ep_axis_name="ep",
+        ep_shard_axis_names=("es1",),
+        activation_checkpointing=False,
+    )
+
+    for gate in gates:
+        assert len(gate.mesh_calls) == 1
+        assert gate.mesh_calls[0].size() == 4  # full DP mesh, not the size-2 ep_shard mesh
+
+
+def test_parallelize_model_injects_none_mesh_when_fsdp_disabled(monkeypatch):
+    """Single-rank runs keep gates on local (mesh=None) bias-update behavior."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 1}, mesh_dim_names=["dp"])
+    model, gates = _make_gate_bias_model(P)
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp",),
+        cp_axis_name=None,
+        tp_axis_name=None,
+        ep_axis_name=None,
+        ep_shard_axis_names=None,
+        activation_checkpointing=False,
+    )
+
+    for gate in gates:
+        assert gate.mesh_calls == [None]
 
 
 def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypatch):
@@ -1143,6 +1233,7 @@ def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):
     class Inner:
         def __init__(self):
             self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer([])
 
     class Outer:
         def __init__(self):
@@ -1228,6 +1319,7 @@ def test_parallelize_model_with_lm_head_precision_string_input(monkeypatch):
     class Inner:
         def __init__(self):
             self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer([])
 
     class Outer:
         def __init__(self):
@@ -1369,6 +1461,7 @@ def test_parallelize_model_passes_wrap_outer_model_to_apply_fsdp(monkeypatch):
     class Inner:
         def __init__(self):
             self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer([])
 
     class Outer:
         def __init__(self):
@@ -1404,6 +1497,7 @@ def test_parallelize_model_wrap_outer_model_defaults_to_true(monkeypatch):
     class Inner:
         def __init__(self):
             self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer([])
 
     class Outer:
         def __init__(self):
@@ -1787,6 +1881,7 @@ def test_parallelize_model_passes_ignore_router_for_ac_to_apply_ac(monkeypatch):
     class Inner:
         def __init__(self):
             self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer([])
 
     class Outer:
         def __init__(self):
@@ -1824,6 +1919,7 @@ def test_parallelize_model_ignore_router_for_ac_defaults_to_true(monkeypatch):
     class Inner:
         def __init__(self):
             self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer([])
 
     class Outer:
         def __init__(self):
@@ -1860,6 +1956,7 @@ def test_parallelize_model_passes_selective_to_apply_ac(monkeypatch):
     class Inner:
         def __init__(self):
             self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer([])
 
     class Outer:
         def __init__(self):
@@ -2281,6 +2378,7 @@ def test_parallelize_model_passes_mp_policy_to_apply_fsdp(monkeypatch):
     class Inner:
         def __init__(self):
             self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer([])
 
     class Outer:
         def __init__(self):
@@ -2315,6 +2413,7 @@ def test_parallelize_model_mp_policy_defaults_to_none(monkeypatch):
     class Inner:
         def __init__(self):
             self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+            self.layers = LayerContainer([])
 
     class Outer:
         def __init__(self):

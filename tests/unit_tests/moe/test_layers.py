@@ -13,11 +13,12 @@
 # limitations under the License.
 
 import importlib.util
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
@@ -1006,6 +1007,53 @@ class TestGate:
         assert not torch.equal(gate.e_score_correction_bias, original_bias)
         # Cumulative load should be reset
         assert gate._cumulative_expert_load is None
+
+    def test_gate_update_bias_deterministic_formula(self, moe_config, device):
+        """bias_i <- bias_i + factor * sign(mean(load) - load_i); a size-1 mesh behaves like no mesh."""
+        moe_config.gate_bias_update_factor = 0.1
+        gate = Gate(moe_config).to(device)
+        gate.train()
+        size_one_mesh = MagicMock()
+        size_one_mesh.size.return_value = 1
+        gate.set_bias_update_mesh(size_one_mesh)  # must not trigger any collective
+
+        # mean(load) = 4 -> deltas: overloaded expert 0 down, idle expert 3 up.
+        gate._cumulative_expert_load = torch.tensor([8.0, 4.0, 4.0, 0.0, 4.0, 4.0, 4.0, 4.0], device=device)
+        expected_delta = torch.tensor([-0.1, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0], device=device)
+
+        gate.update_bias()
+
+        assert gate.e_score_correction_bias.dtype == torch.float32
+        torch.testing.assert_close(gate.e_score_correction_bias, expected_delta)
+        assert gate._cumulative_expert_load is None
+
+    def test_gate_update_bias_reduces_load_on_explicit_mesh(self, moe_config, device):
+        """With an injected mesh, the LOCAL load is summed over that mesh even though the bias is a plain buffer."""
+        moe_config.gate_bias_update_factor = 0.1
+        gate = Gate(moe_config).to(device)
+        gate.train()
+
+        local_load = torch.tensor([8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device)
+        gate._cumulative_expert_load = local_load.clone()
+
+        fake_mesh = MagicMock()
+        fake_mesh.size.return_value = 2
+        fake_mesh.ndim = 1
+        gate.set_bias_update_mesh(fake_mesh)
+
+        # Simulate the mesh all-reduce: another rank contributed [0,...,0,8].
+        global_load = torch.tensor([8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0], device=device)
+        with patch.object(DTensor, "from_local") as from_local_mock:
+            from_local_mock.return_value.full_tensor.return_value = global_load
+            gate.update_bias()
+
+        args, kwargs = from_local_mock.call_args
+        assert kwargs["device_mesh"] is fake_mesh
+        torch.testing.assert_close(args[0], local_load)
+
+        # mean(global) = 2 -> experts 0 and 7 down, all others up.
+        expected = torch.tensor([-0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, -0.1], device=device)
+        torch.testing.assert_close(gate.e_score_correction_bias, expected)
 
     def test_gate_init_weights(self, moe_config, device):
         """Test Gate weight initialization."""

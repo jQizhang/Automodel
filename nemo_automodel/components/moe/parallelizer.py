@@ -32,6 +32,7 @@ from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
+    Gate,
     MoE,
 )
 from nemo_automodel.shared.utils import dtype_from_str
@@ -631,6 +632,17 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
             moe_module.cp_mesh = cp_mesh
 
 
+def apply_gate_bias_update_mesh(model: nn.Module, bias_update_mesh: DeviceMesh | None) -> None:
+    """Inject the expert-load reduction mesh into each generic ``Gate`` of the model (or pipeline stage)."""
+    inner_model = model.model if hasattr(model, "model") and model.model is not None else model
+    inner_model = get_text_module(inner_model)
+
+    for block in _iter_moe_blocks(model, inner_model):
+        moe_module = _get_moe_module(block)
+        if moe_module is not None and isinstance(moe_module.gate, Gate):
+            moe_module.gate.set_bias_update_mesh(bias_update_mesh)
+
+
 def parallelize_model(
     model: torch.nn.Module,
     world_mesh: DeviceMesh,
@@ -696,3 +708,6 @@ def parallelize_model(
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
         )
+
+    # Gates route rank-local tokens before EP dispatch, so the load reduction always spans the full DP/CP mesh.
+    apply_gate_bias_update_mesh(model, fsdp_mesh)

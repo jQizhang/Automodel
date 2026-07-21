@@ -277,6 +277,9 @@ class Gate(nn.Module):
 
         self.e_score_correction_bias_master = None
 
+        # Runtime-only mesh for the expert-load reduction in update_bias(); injected by the parallelizer, never serialized.
+        self.bias_update_mesh: DeviceMesh | None = None
+
         # Cumulative expert load is a tensor representing the number of tokens
         # routed to each expert on the current rank, accumulated across gradient
         # accumulation steps.
@@ -460,6 +463,10 @@ class Gate(nn.Module):
 
         return weights.type_as(x), indices, aux_loss
 
+    def set_bias_update_mesh(self, mesh: DeviceMesh | None) -> None:
+        """Set the mesh covering all independent token shards (e.g. full DP/CP mesh) for the ``update_bias`` reduction."""
+        self.bias_update_mesh = mesh
+
     def update_bias(self) -> None:
         """
         Updates the correction bias used in the gate based on the popularity of experts.
@@ -485,9 +492,15 @@ class Gate(nn.Module):
         expert_load = self._cumulative_expert_load
         self._cumulative_expert_load = None
 
-        # Place the expert load on the same device mesh as the score correction
-        # bias parameter, and sum across all ranks.
-        if isinstance(self.e_score_correction_bias, DTensor):
+        # The explicit runtime mesh takes priority: under fully_shard() the bias is a plain buffer, not a DTensor.
+        if self.bias_update_mesh is not None and self.bias_update_mesh.size() > 1:
+            expert_load = DTensor.from_local(
+                expert_load,
+                device_mesh=self.bias_update_mesh,
+                placements=[Partial()] * self.bias_update_mesh.ndim,
+            )
+            expert_load = expert_load.full_tensor()
+        elif isinstance(self.e_score_correction_bias, DTensor):
             expert_load = DTensor.from_local(
                 expert_load,
                 device_mesh=self.e_score_correction_bias.device_mesh,
